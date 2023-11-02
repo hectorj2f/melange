@@ -605,6 +605,210 @@ func (cfg *Configuration) propagatePipelines() {
 	}
 }
 
+// ParseConfigurationWithoutDefaults returns a decoded build Configuration using the parsing options provided.
+func ParseConfigurationWithoutDefaults(configurationFilePath string, opts ...ConfigurationParsingOption) (*Configuration, error) {
+	options := &configOptions{}
+	configurationDirPath := filepath.Dir(configurationFilePath)
+	options.include(opts...)
+
+	if options.filesystem == nil {
+		// TODO: this is an abstraction leak, and we can remove this `if statement` once
+		//  ParseConfiguration relies solely on an abstract fs.FS.
+
+		options.filesystem = os.DirFS(configurationDirPath)
+		configurationFilePath = filepath.Base(configurationFilePath)
+	}
+
+	if configurationFilePath == "" {
+		return nil, errors.New("no configuration file path provided")
+	}
+
+	f, err := options.filesystem.Open(configurationFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	root := yaml.Node{}
+
+	cfg := Configuration{root: &root}
+
+	// Unmarshal into a node first
+	decoderNode := yaml.NewDecoder(f)
+	err = decoderNode.Decode(&root)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode configuration file %q: %w", configurationFilePath, err)
+	}
+
+	// XXX(Elizafox) - Node.Decode doesn't allow setting of KnownFields, so we do this cheesy hack below
+	data, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode configuration file %q: %w", configurationFilePath, err)
+	}
+
+	// Now unmarshal it into the struct, part of said cheesy hack
+	reader := bytes.NewReader(data)
+	decoder := yaml.NewDecoder(reader)
+	decoder.KnownFields(true)
+	err = decoder.Decode(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode configuration file %q: %w", configurationFilePath, err)
+	}
+
+	datas := make(map[string]DataItems)
+	for _, d := range cfg.Data {
+		datas[d.Name] = d.Items
+	}
+	subpackages := []Subpackage{}
+	for _, sp := range cfg.Subpackages {
+		if sp.Range == "" {
+			subpackages = append(subpackages, sp)
+			continue
+		}
+		items, ok := datas[sp.Range]
+		if !ok {
+			return nil, fmt.Errorf("unable to parse configuration file %q: subpackage %q specified undefined range: %q", configurationFilePath, sp.Name, sp.Range)
+		}
+
+		// Ensure iterating over items is deterministic by sorting keys alphabetically
+		keys := make([]string, 0, len(items))
+		for k := range items {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			v := items[k]
+			replacer := replacerFromMap(map[string]string{
+				"${{range.key}}":   k,
+				"${{range.value}}": v,
+			})
+			thingToAdd := Subpackage{
+				Name:        replacer.Replace(sp.Name),
+				Description: replacer.Replace(sp.Description),
+				Dependencies: Dependencies{
+					Runtime:          replaceAll(replacer, sp.Dependencies.Runtime),
+					Provides:         replaceAll(replacer, sp.Dependencies.Provides),
+					Replaces:         replaceAll(replacer, sp.Dependencies.Replaces),
+					ProviderPriority: sp.Dependencies.ProviderPriority,
+				},
+				Options: sp.Options,
+				URL:     replacer.Replace(sp.URL),
+				If:      replacer.Replace(sp.If),
+			}
+			for _, p := range sp.Pipeline {
+				// take a copy of the with map, so we can replace the values
+				replacedWith := make(map[string]string)
+				for key, value := range p.With {
+					replacedWith[key] = replacer.Replace(value)
+				}
+
+				// if the map is empty, set it to nil to avoid serializing an empty map
+				if len(replacedWith) == 0 {
+					replacedWith = nil
+				}
+
+				thingToAdd.Pipeline = append(thingToAdd.Pipeline, Pipeline{
+					Name:   p.Name,
+					Uses:   p.Uses,
+					With:   replacedWith,
+					Inputs: p.Inputs,
+					Needs:  p.Needs,
+					Label:  p.Label,
+					Runs:   replacer.Replace(p.Runs),
+					// TODO: p.Pipeline?
+				})
+			}
+			subpackages = append(subpackages, thingToAdd)
+		}
+	}
+	// hectorj2f Why this was set to nil
+	// cfg.Data = nil // TODO: zero this out or not?
+	cfg.Subpackages = subpackages
+
+	// TODO: validate that subpackage ranges have been consumed and applied
+
+	// Merge environment file if needed.
+	if envFile := options.envFilePath; envFile != "" {
+		envMap, err := godotenv.Read(envFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading environment file: %w", err)
+		}
+
+		curEnv := cfg.Environment.Environment
+		cfg.Environment.Environment = envMap
+
+		// Overlay the environment in the YAML on top as override.
+		for k, v := range curEnv {
+			cfg.Environment.Environment[k] = v
+		}
+	}
+
+	// Set up some useful environment variables.
+	if cfg.Environment.Environment == nil {
+		cfg.Environment.Environment = make(map[string]string)
+	}
+
+	const (
+		defaultEnvVarHOME   = "/home/build"
+		defaultEnvVarGOPATH = "/home/build/.cache/go"
+	)
+
+	// If a variables file was defined, merge it into the variables block.
+	if varsFile := options.varsFilePath; varsFile != "" {
+		f, err := os.Open(varsFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading variables file: %w", err)
+		}
+		defer f.Close()
+
+		vars := map[string]string{}
+		err = yaml.NewDecoder(f).Decode(&vars)
+		if err != nil {
+			return nil, fmt.Errorf("loading variables file: %w", err)
+		}
+
+		for k, v := range vars {
+			cfg.Vars[k] = v
+		}
+	}
+
+	// Mutate config properties with substitutions.
+	configMap := buildConfigMap(&cfg)
+	replacer := replacerFromMap(configMap)
+
+	cfg.Package.Name = replacer.Replace(cfg.Package.Name)
+	cfg.Package.Version = replacer.Replace(cfg.Package.Version)
+	cfg.Package.Description = replacer.Replace(cfg.Package.Description)
+
+	subpackages = []Subpackage{}
+
+	for _, sp := range cfg.Subpackages {
+		sp.Name = replacer.Replace(sp.Name)
+		sp.Description = replacer.Replace(sp.Description)
+
+		subpackages = append(subpackages, sp)
+	}
+
+	cfg.Subpackages = subpackages
+
+	if err := cfg.applySubstitutionsForProvides(); err != nil {
+		return nil, err
+	}
+	if err := cfg.applySubstitutionsForRuntime(); err != nil {
+		return nil, err
+	}
+
+	// Propagate all child pipelines
+	cfg.propagatePipelines()
+
+	// Finally, validate the configuration we ended up with before returning it for use downstream.
+	if err = cfg.validate(); err != nil {
+		return nil, fmt.Errorf("validating configuration: %w", err)
+	}
+
+	return &cfg, nil
+}
+
 // ParseConfiguration returns a decoded build Configuration using the parsing options provided.
 func ParseConfiguration(configurationFilePath string, opts ...ConfigurationParsingOption) (*Configuration, error) {
 	options := &configOptions{}
